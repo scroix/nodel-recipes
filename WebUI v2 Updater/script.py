@@ -26,7 +26,10 @@ import os
 import base64
 import jarray
 from java.io import File, FileInputStream, FileOutputStream, BufferedInputStream, BufferedOutputStream, RandomAccessFile
-from java.net import URL
+# handlers catch (Exception, Throwable): Jython's "except Exception" matches only
+# Python exceptions, so a Java throwable would otherwise escape every handler here
+from java.lang import Throwable
+from java.net import URL, URLConnection
 from java.nio.file import Files
 from java.security import MessageDigest
 from java.util.zip import ZipFile
@@ -223,22 +226,21 @@ def _acquire_host_lock():
         raise Exception('updater lock must not be a symbolic link')
     channel = RandomAccessFile(p['lock'], 'rw').getChannel()
     try:
-        lock = channel.tryLock()
-    except Exception:
+        held = channel.tryLock()
+    except (Exception, Throwable):
+        # tryLock raises OverlappingFileLockException when this JVM already holds
+        # the lock, which is the usual case for a second updater node
+        held = None
+    if held is None:
         channel.close()
         raise Exception('another WebUI v2 updater is active on this host')
-    if lock is None:
-        channel.close()
-        raise Exception('another WebUI v2 updater is active on this host')
-    return channel, lock
+    return channel
 
-def _release_host_lock(handle):
-    if handle is None:
-        return
-    channel, lock = handle
-    try:
-        lock.release()
-    finally:
+def _release_host_lock(channel):
+    # Closing the channel releases every lock taken through it. FileLock.release()
+    # must not be called: its runtime class is sun.nio.ch.FileLockImpl, which
+    # java.base does not export, so Jython cannot invoke it on Java 16 or later.
+    if channel is not None:
         channel.close()
 
 
@@ -259,14 +261,20 @@ def _resolve_release(tag):
     return _api_get('repos/%s/releases/tags/%s' % (_repo(), tag))
 
 def _download(url, destFile, maxBytes):
+    # Jython resolves a method against the object's runtime class, and an HTTPS
+    # connection is a sun.net.www.protocol.https instance that java.base does not
+    # export. Calling through the exported java.net.URLConnection supertype keeps
+    # these working on Java 16 and later.
     conn = URL(url).openConnection()
-    conn.setConnectTimeout(15000)
-    conn.setReadTimeout(120000)
-    conn.setRequestProperty('User-Agent', UA)
-    declared = conn.getContentLengthLong()
+    URLConnection.setConnectTimeout(conn, 15000)
+    URLConnection.setReadTimeout(conn, 120000)
+    URLConnection.setRequestProperty(conn, 'User-Agent', UA)
+    declared = URLConnection.getContentLengthLong(conn)
     if declared > maxBytes:
         raise Exception('download exceeds %s-byte safety limit' % maxBytes)
-    ins = BufferedInputStream(conn.getInputStream())
+    # the BufferedInputStream wrapper keeps the later read and close calls on an
+    # exported java.io class rather than the connection's internal stream
+    ins = BufferedInputStream(URLConnection.getInputStream(conn))
     try:
         destFile.getParentFile().mkdirs()
         outs = BufferedOutputStream(FileOutputStream(destFile))
@@ -453,7 +461,7 @@ def _verify_attestation(assetName, digest, release, tag):
                     break
             if commitMatches:
                 return
-        except Exception:
+        except (Exception, Throwable):
             pass
 
     raise Exception('ZIP has no matching GitHub artifact attestation')
@@ -506,7 +514,7 @@ def _installed_info():
         return None
     try:
         return json_decode(Stream.readFully(p['marker']))
-    except Exception, e:
+    except (Exception, Throwable), e:
         console.warn('could not read installed marker: %s' % e)
         return None
 
@@ -595,7 +603,7 @@ def _recover_transaction():
         return False
     try:
         info = json_decode(Stream.readFully(p['transaction']))
-    except Exception, e:
+    except (Exception, Throwable), e:
         raise Exception('transaction marker is unreadable; preserve updater state for recovery: %s' % e)
 
     operation = info.get('operation')
@@ -611,7 +619,7 @@ def _recover_transaction():
             _finish_transaction()
             try:
                 _cleanup_committed_state(p)
-            except Exception, e:
+            except (Exception, Throwable), e:
                 console.warn('repaired installation recovered; old swap cleanup failed: %s' % e)
             return True
         if not p['backup'].isDirectory():
@@ -731,7 +739,7 @@ def _install_staged(stagingDir, release, tag, preserveBackup=False):
             _finish_transaction()
             try:
                 _cleanup_committed_state(p)
-            except Exception, e:
+            except (Exception, Throwable), e:
                 console.warn('repair completed but old swap cleanup failed: %s' % e)
         else:
             if p['backup'].isDirectory():
@@ -740,9 +748,9 @@ def _install_staged(stagingDir, release, tag, preserveBackup=False):
             _finish_transaction()
             try:
                 _cleanup_committed_state(p)
-            except Exception, e:
+            except (Exception, Throwable), e:
                 console.warn('install completed but old backup cleanup failed: %s' % e)
-    except Exception:
+    except (Exception, Throwable):
         _recover_transaction()
         raise
 
@@ -802,7 +810,7 @@ def _do_check():
             console.info('up to date and verified (%s)' % latestTag)
             local_event_Status.emit({'level': 0, 'message': 'Up to date and verified (%s)' % latestTag})
 
-    except Exception, e:
+    except (Exception, Throwable), e:
         console.error('check failed: %s' % e)
         local_event_Status.emit({'level': 2, 'message': 'Check failed: %s' % e})
     finally:
@@ -912,7 +920,7 @@ def Update(arg=None):
         try:
             _rm_tree(p['staging'])
             _rm_tree(p['downloads'])
-        except Exception, e:
+        except (Exception, Throwable), e:
             cleanupWarning = str(e)
             console.warn('installed %s but temporary-file cleanup failed: %s' % (tag, e))
 
@@ -923,7 +931,7 @@ def Update(arg=None):
             current = _installed_info()
             local_event_UpdateAvailable.emitIfDifferent(
                 latest is not None and not _same_release(current, latest))
-        except Exception, e:
+        except (Exception, Throwable), e:
             console.warn('installed %s but status refresh failed: %s' % (tag, e))
         console.info('installed %s (previous version retained for Rollback)' % tag)
         if cleanupWarning is None:
@@ -933,7 +941,7 @@ def Update(arg=None):
                                      'message': 'Installed and verified %s; temporary cleanup needs attention'
                                                 % tag})
 
-    except Exception, e:
+    except (Exception, Throwable), e:
         console.error('update failed: %s' % e)
         local_event_Status.emit({'level': 2, 'message': 'Update failed: %s' % e})
     finally:
@@ -1004,9 +1012,9 @@ def _rollback(p):
         _finish_transaction()
         try:
             _cleanup_committed_state(p)
-        except Exception, e:
+        except (Exception, Throwable), e:
             console.warn('rollback completed but old backup cleanup failed: %s' % e)
-    except Exception:
+    except (Exception, Throwable):
         _recover_transaction()
         raise
 
@@ -1040,7 +1048,7 @@ def Rollback(arg=None):
         local_event_Status.emit({'level': 0, 'message': 'Rolled back to %s'
                                  % local_event_InstalledVersion.getArg()})
 
-    except Exception, e:
+    except (Exception, Throwable), e:
         console.error('rollback failed: %s' % e)
         local_event_Status.emit({'level': 2, 'message': 'Rollback failed: %s' % e})
     finally:
@@ -1063,7 +1071,7 @@ def setup():
         _recover_transaction()
         _emit_installed()
         _emit_integrity()
-    except Exception, e:
+    except (Exception, Throwable), e:
         console.warn('could not determine installed version: %s' % e)
         local_event_Status.emit({'level': 2, 'message': 'Updater recovery failed: %s' % e})
     finally:
